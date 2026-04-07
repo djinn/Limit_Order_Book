@@ -1,5 +1,7 @@
+
+
 """
-Poisson Limit Order Book — demo.
+Poisson Limit Order Book
 
 Run:
     python main.py
