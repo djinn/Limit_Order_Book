@@ -81,16 +81,31 @@ def plot_gamma_comparison(
     fig, axes_grid = plt.subplots(nrows, ncols, figsize=(15, 5 * nrows), sharey=False)
     axes = axes_grid.flatten()
 
+    # Compute symmetric axis limits across all panels
+    all_wealth = np.concatenate([
+        [s.wealth for s in res.snapshots] for _, _, res in gamma_results
+    ])
+    all_inv = np.concatenate([
+        [s.inventory for s in res.snapshots] for _, _, res in gamma_results
+    ])
+    wealth_lim = max(abs(all_wealth.min()), abs(all_wealth.max()))
+    inv_lim    = max(abs(all_inv.min()),    abs(all_inv.max()))
+
     for ax, (g, label, res) in zip(axes, gamma_results):
         t   = np.array([s.time      for s in res.snapshots])
         w   = np.array([s.wealth    for s in res.snapshots])
         inv = np.array([s.inventory for s in res.snapshots])
 
+        fills = res.bid_fills + res.ask_fills
         ax.plot(t, w, color=COLORS["wealth"], lw=1, label="wealth")
         ax.axhline(0, color="gray", lw=0.5, ls="--")
-        ax.set_title(f"γ = {g}  —  {label}", fontsize=11)
+        ax.set_title(
+            f"γ = {g}  —  {label}\nfills: {fills}  |  final wealth: {w[-1]:.1f}",
+            fontsize=11,
+        )
         ax.set_xlabel("time")
         ax.set_ylabel("wealth")
+        ax.set_ylim(-wealth_lim, wealth_lim)
         ax.legend(fontsize=8, loc="upper left")
         ax.grid(True, ls="--", alpha=0.4)
 
@@ -98,6 +113,7 @@ def plot_gamma_comparison(
         ax_inv.plot(t, inv, color=COLORS["inventory"], lw=0.8, alpha=0.7, label="inventory")
         ax_inv.axhline(0, color="black", lw=0.4, ls=":")
         ax_inv.set_ylabel("inventory", color=COLORS["inventory"])
+        ax_inv.set_ylim(-inv_lim, inv_lim)
         ax_inv.tick_params(axis="y", labelcolor=COLORS["inventory"])
         ax_inv.legend(fontsize=8, loc="upper right")
 
