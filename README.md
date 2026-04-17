@@ -227,8 +227,3 @@ If you’ve built:
 Fork it. Break it. Improve it.
 
 ---
-
-**Final question:**
-
-Are you modeling the market…
-or the consequences of interacting with it?
