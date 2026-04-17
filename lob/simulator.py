@@ -1,37 +1,39 @@
 """
-Poisson event simulator for the OrderBook.
+Poisson order book simulator.
 
-Event model
------------
-Six independent Poisson processes, one per event type, with total rate:
+This module simulates a limit order book as a discrete-time approximation
+to a continuous-time Markov process driven by six independent Poisson event
+streams.
 
-    Λ = Σ λᵢ
+Model
+-----
+Let λ_i be the intensity of event type i, and let
 
-Each time step dt:
-  1. Fire one event with probability Λ * dt (Bernoulli).
-  2. If an event fires, choose which type with probability λᵢ / Λ.
-  3. Apply the event to the book.
-  4. Record the book state.
+    Λ = Σ λ_i
 
-This gives at most one book transition per time step, which is the
-standard discrete-time approximation to a continuous-time Markov chain.
-Valid when Λ * dt << 1.
+At each time step dt:
 
-Parameters
-----------
-lambdas : dict[str, float]
-    Arrival rate for each of the six event types.
-dt : float
-    Time step size (keep Λ * dt << 1).
-n_steps : int
-    Number of time steps to simulate.
-seed : int | None
-    RNG seed for reproducibility.
+1. An event occurs with probability Λ * dt.
+2. Conditional on occurrence, the event type is sampled with probability
+   λ_i / Λ.
+3. Exactly one state transition is applied.
+4. The post-transition state is recorded.
+
+Invariant
+---------
+At most one event may occur in a single time step.
+
+Stability condition
+-------------------
+Λ * dt << 1
+
+Violating this condition biases the simulation by suppressing the possibility
+of multiple arrivals within a step.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -39,15 +41,14 @@ import numpy as np
 from .book import OrderBook
 from .market_maker import MarketMaker
 
-
-EVENTS = [
+EVENTS = (
     "buy_market_order",
     "sell_market_order",
     "buy_limit_order",
     "sell_limit_order",
     "cancel_bid",
     "cancel_ask",
-]
+)
 
 
 @dataclass
@@ -60,7 +61,7 @@ class Snapshot:
     ask_size: int
     mid_price: float
     spread: int
-    event: Optional[str]   # event that fired this step, or None
+    event: Optional[str]
     inventory: int
     cash: float
     wealth: float
@@ -69,45 +70,195 @@ class Snapshot:
 @dataclass
 class SimulationResult:
     snapshots: List[Snapshot]
-    event_counts: Dict[str, int]   # total times each event fired
-    ask_depletions: int             # times ask queue hit zero → price up
-    bid_depletions: int             # times bid queue hit zero → price down
-    bid_fills: int                  # times MM bought (sell MO hit)
-    ask_fills: int                  # times MM sold (buy MO hit)
+    event_counts: Dict[str, int]
+    ask_depletions: int
+    bid_depletions: int
+    bid_fills: int
+    ask_fills: int
 
     @property
     def total_events(self) -> int:
         return sum(self.event_counts.values())
 
     def print_diagnostics(self, lambdas: Dict[str, float], dt: float) -> None:
-        T = len(self.snapshots) * dt
-        print(f"\nEvent diagnostics (T = {T:.1f}):")
+        horizon = len(self.snapshots) * dt
+
+        print(f"\nEvent diagnostics (T = {horizon:.1f}):")
         print(f"  {'event':<22}  {'fired':>6}  {'expected':>8}  {'ratio':>6}")
-        print(f"  {'-'*22}  {'-'*6}  {'-'*8}  {'-'*6}")
-        for e in EVENTS:
-            fired    = self.event_counts.get(e, 0)
-            expected = lambdas.get(e, 0.0) * T
-            ratio    = fired / expected if expected > 0 else float("nan")
-            print(f"  {e:<22}  {fired:>6}  {expected:>8.1f}  {ratio:>6.3f}")
-        print(f"\nQueue depletions:")
+        print(f"  {'-' * 22}  {'-' * 6}  {'-' * 8}  {'-' * 6}")
+
+        for event in EVENTS:
+            fired = self.event_counts.get(event, 0)
+            expected = lambdas.get(event, 0.0) * horizon
+            ratio = fired / expected if expected > 0 else float("nan")
+            print(f"  {event:<22}  {fired:>6}  {expected:>8.1f}  {ratio:>6.3f}")
+
+        print("\nQueue depletions:")
         print(f"  ask depleted (price up):   {self.ask_depletions}")
         print(f"  bid depleted (price down): {self.bid_depletions}")
-        print(f"\nMM fill counts:")
+
+        print("\nMM fill counts:")
         print(f"  bid fills (MM bought): {self.bid_fills}")
         print(f"  ask fills (MM sold):   {self.ask_fills}")
 
 
 def fill_probability(delta: float, k: float = 2.0) -> float:
     """
-    Logistic fill probability based on quote aggressiveness.
+    Convert quote aggressiveness into a fill probability using a logistic map.
 
-    delta > 0 : quote improves on best price  → p > 0.5
-    delta = 0 : quote matches best price       → p = 0.5
-    delta < 0 : quote is passive               → p < 0.5
+    Interpretation
+    --------------
+    delta > 0  : quote improves on the best price   -> p > 0.5
+    delta = 0  : quote matches the best price       -> p = 0.5
+    delta < 0  : quote is passive                   -> p < 0.5
 
-    k controls sensitivity: small k = flat, large k = step-like.
+    Parameters
+    ----------
+    delta:
+        Signed quote aggressiveness.
+    k:
+        Logistic steepness. Larger values make the response more step-like.
     """
     return 1.0 / (1.0 + np.exp(-k * delta))
+
+
+def _build_rate_vector(lambdas: Dict[str, float]) -> np.ndarray:
+    return np.array([lambdas.get(event, 0.0) for event in EVENTS], dtype=float)
+
+
+def _validate_time_step(total_rate: float, dt: float) -> float:
+    fire_probability = total_rate * dt
+    if fire_probability >= 1.0:
+        raise ValueError(
+            f"Invalid discretization: Λ * dt = {fire_probability:.6f} must be < 1. "
+            "Reduce dt or the event intensities."
+        )
+    return fire_probability
+
+
+def _market_maker_quotes(
+    book: OrderBook, mm: MarketMaker, gamma: float
+) -> tuple[int, int]:
+    """
+    Compute inventory-aware market maker quotes.
+
+    Reservation price:
+        r = mid - gamma * inventory
+    """
+    reservation_price = book.mid_price - gamma * mm.inventory
+    half_spread = (book.ask_price - book.bid_price) / 2.0
+
+    mm_bid = int(round(reservation_price - half_spread))
+    mm_ask = int(round(reservation_price + half_spread))
+    return mm_bid, mm_ask
+
+
+def _fill_chance(
+    *,
+    event: str,
+    book: OrderBook,
+    mm_bid: int,
+    mm_ask: int,
+    fill_mode: str,
+    p_fill: float,
+    k: float,
+) -> float:
+    """
+    Compute market maker fill probability for a market-order event.
+    """
+    if event == "sell_market_order":
+        if fill_mode == "logistic":
+            return fill_probability(mm_bid - book.bid_price, k)
+        return p_fill if mm_bid >= book.bid_price else 0.0
+
+    if event == "buy_market_order":
+        if fill_mode == "logistic":
+            return fill_probability(book.ask_price - mm_ask, k)
+        return p_fill if mm_ask <= book.ask_price else 0.0
+
+    return 0.0
+
+
+def _attempt_market_maker_fill(
+    *,
+    rng: np.random.Generator,
+    event: str,
+    book: OrderBook,
+    mm: MarketMaker,
+    gamma: float,
+    fill_mode: str,
+    p_fill: float,
+    k: float,
+) -> tuple[int, int]:
+    """
+    Attempt a market maker execution on a market-order event.
+
+    Returns
+    -------
+    bid_fill_increment, ask_fill_increment
+    """
+    if event not in {"buy_market_order", "sell_market_order"}:
+        return 0, 0
+
+    mm_bid, mm_ask = _market_maker_quotes(book, mm, gamma)
+    probability = _fill_chance(
+        event=event,
+        book=book,
+        mm_bid=mm_bid,
+        mm_ask=mm_ask,
+        fill_mode=fill_mode,
+        p_fill=p_fill,
+        k=k,
+    )
+
+    if rng.random() >= probability:
+        return 0, 0
+
+    if event == "sell_market_order":
+        mm.inventory += 1
+        mm.cash -= mm_bid
+        return 1, 0
+
+    mm.inventory -= 1
+    mm.cash += mm_ask
+    return 0, 1
+
+
+def _apply_book_event(book: OrderBook, event: str) -> tuple[int, int]:
+    """
+    Apply an event to the order book and detect queue depletion via price moves.
+
+    Returns
+    -------
+    ask_depletion_increment, bid_depletion_increment
+    """
+    old_ask_price = book.ask_price
+    old_bid_price = book.bid_price
+
+    getattr(book, event)()
+
+    ask_depletion = int(book.ask_price > old_ask_price)
+    bid_depletion = int(book.bid_price < old_bid_price)
+    return ask_depletion, bid_depletion
+
+
+def _snapshot(
+    step: int, time: float, book: OrderBook, mm: MarketMaker, event: Optional[str]
+) -> Snapshot:
+    return Snapshot(
+        step=step,
+        time=time,
+        bid_price=book.bid_price,
+        ask_price=book.ask_price,
+        bid_size=book.bid_size,
+        ask_size=book.ask_size,
+        mid_price=book.mid_price,
+        spread=book.spread,
+        event=event,
+        inventory=mm.inventory,
+        cash=mm.cash,
+        wealth=mm.wealth(book.mid_price),
+    )
 
 
 def simulate(
@@ -127,20 +278,41 @@ def simulate(
     seed: Optional[int] = None,
 ) -> SimulationResult:
     """
-    Run the Poisson simulation.
+    Simulate a limit order book under Poisson-driven event flow.
 
-    p_fill    : constant fill probability used when fill_mode="constant".
-    gamma     : inventory-aversion parameter.  0 = symmetric quoting.
-                The MM quotes around r = mid - gamma * inventory.
-    fill_mode : "constant" uses p_fill for every market order.
-                "logistic" derives fill probability from quote aggressiveness
-                via a logistic function — no hard quote-crossing guard.
-    k         : logistic sensitivity (fill_mode="logistic" only).
-                Small k → gradual, large k → near step-function.
+    Parameters
+    ----------
+    lambdas:
+        Event intensities keyed by event name.
+    dt:
+        Time step. Must satisfy Λ * dt < 1.
+    n_steps:
+        Number of simulation steps.
+    bid_price, ask_price, bid_size, ask_size, tick_size, default_depth:
+        Initial order book state.
+    p_fill:
+        Constant fill probability when fill_mode="constant".
+    gamma:
+        Inventory aversion. Quotes are centered at:
+            r = mid - gamma * inventory
+    fill_mode:
+        Either:
+        - "constant": use p_fill subject to quote competitiveness
+        - "logistic": derive fill probability from quote aggressiveness
+    k:
+        Logistic steepness for fill_mode="logistic".
+    seed:
+        RNG seed.
 
-    Returns a SimulationResult with snapshots and diagnostics.
+    Returns
+    -------
+    SimulationResult
     """
+    if fill_mode not in {"constant", "logistic"}:
+        raise ValueError("fill_mode must be either 'constant' or 'logistic'.")
+
     rng = np.random.default_rng(seed)
+
     book = OrderBook(
         bid_price=bid_price,
         ask_price=ask_price,
@@ -149,88 +321,54 @@ def simulate(
         tick_size=tick_size,
         default_depth=default_depth,
     )
-
-    rates = np.array([lambdas.get(e, 0.0) for e in EVENTS])
-    total_rate = rates.sum()
-    probs = rates / total_rate          # selection weights
-    fire_prob = total_rate * dt         # probability any event fires this step
-
-    assert fire_prob < 1, (
-        f"Λ * dt = {fire_prob:.3f} must be < 1. Reduce dt or lambda."
-    )
-
     mm = MarketMaker()
+
+    rates = _build_rate_vector(lambdas)
+    total_rate = float(rates.sum())
+    fire_probability = _validate_time_step(total_rate, dt)
+
+    if total_rate == 0.0:
+        event_probabilities = None
+    else:
+        event_probabilities = rates / total_rate
+
     snapshots: List[Snapshot] = []
-    event_counts: Dict[str, int] = {e: 0 for e in EVENTS}
+    event_counts: Dict[str, int] = {event: 0 for event in EVENTS}
+
     ask_depletions = 0
     bid_depletions = 0
     bid_fills = 0
     ask_fills = 0
-    t = 0.0
+
+    current_time = 0.0
 
     for step in range(n_steps):
         fired_event: Optional[str] = None
 
-        if rng.random() < fire_prob:
-            idx = rng.choice(len(EVENTS), p=probs)
-            fired_event = EVENTS[idx]
+        if total_rate > 0.0 and rng.random() < fire_probability:
+            event_index = int(rng.choice(len(EVENTS), p=event_probabilities))
+            fired_event = EVENTS[event_index]
             event_counts[fired_event] += 1
 
-            # 1. Compute inventory-adjusted MM quotes (Step 3A)
-            #    r = mid - gamma * inventory  → lean against accumulated position
-            mid = book.mid_price
-            r = mid - gamma * mm.inventory
-            half_spread = (book.ask_price - book.bid_price) / 2.0
-            mm_bid = int(round(r - half_spread))
-            mm_ask = int(round(r + half_spread))
+            bid_fill_inc, ask_fill_inc = _attempt_market_maker_fill(
+                rng=rng,
+                event=fired_event,
+                book=book,
+                mm=mm,
+                gamma=gamma,
+                fill_mode=fill_mode,
+                p_fill=p_fill,
+                k=k,
+            )
+            bid_fills += bid_fill_inc
+            ask_fills += ask_fill_inc
 
-            # 2. Determine fill probability and attempt MM execution
-            if fired_event == "sell_market_order":
-                if fill_mode == "logistic":
-                    delta = mm_bid - book.bid_price
-                    p = fill_probability(delta, k)
-                else:
-                    p = p_fill if mm_bid >= book.bid_price else 0.0
-                if rng.random() < p:
-                    mm.inventory += 1
-                    mm.cash -= mm_bid
-                    bid_fills += 1
-            elif fired_event == "buy_market_order":
-                if fill_mode == "logistic":
-                    delta = book.ask_price - mm_ask
-                    p = fill_probability(delta, k)
-                else:
-                    p = p_fill if mm_ask <= book.ask_price else 0.0
-                if rng.random() < p:
-                    mm.inventory -= 1
-                    mm.cash += mm_ask
-                    ask_fills += 1
+            ask_dep_inc, bid_dep_inc = _apply_book_event(book, fired_event)
+            ask_depletions += ask_dep_inc
+            bid_depletions += bid_dep_inc
 
-            # 2. Update book, track depletions via price moves
-            pre_ask_price = book.ask_price
-            pre_bid_price = book.bid_price
-            getattr(book, fired_event)()
-            if book.ask_price > pre_ask_price:
-                ask_depletions += 1
-            if book.bid_price < pre_bid_price:
-                bid_depletions += 1
-
-        # 3. Record state (wealth marked to post-event mid)
-        snapshots.append(Snapshot(
-            step=step,
-            time=t,
-            bid_price=book.bid_price,
-            ask_price=book.ask_price,
-            bid_size=book.bid_size,
-            ask_size=book.ask_size,
-            mid_price=book.mid_price,
-            spread=book.spread,
-            event=fired_event,
-            inventory=mm.inventory,
-            cash=mm.cash,
-            wealth=mm.wealth(book.mid_price),
-        ))
-        t += dt
+        snapshots.append(_snapshot(step, current_time, book, mm, fired_event))
+        current_time += dt
 
     return SimulationResult(
         snapshots=snapshots,
