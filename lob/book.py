@@ -35,9 +35,9 @@ class OrderBook:
         tick_size: int = 1,
         default_depth: int = 10,
     ) -> None:
-        assert ask_price - bid_price == 2 * tick_size, (
-            "Initial spread must equal 2 * tick_size"
-        )
+        if ask_price - bid_price != 2 * tick_size:
+            raise ValueError("Initial spread must equal 2 * tick_size")
+
         self.bid_price = bid_price
         self.ask_price = ask_price
         self.bid_size = bid_size
@@ -45,69 +45,55 @@ class OrderBook:
         self.tick_size = tick_size
         self.default_depth = default_depth
 
-    # ------------------------------------------------------------------
-    # Read-only properties
-    # ------------------------------------------------------------------
+        self._recompute_derived()
 
-    @property
-    def mid_price(self) -> float:
-        return (self.bid_price + self.ask_price) / 2.0
+    def _recompute_derived(self) -> None:
+        self.mid_price = (self.bid_price + self.ask_price) * 0.5
+        self.spread = self.ask_price - self.bid_price
 
-    @property
-    def spread(self) -> int:
-        return self.ask_price - self.bid_price
+    def _shift_up(self) -> None:
+        self.bid_price += self.tick_size
+        self.ask_price += self.tick_size
+        self._recompute_derived()
 
-    # ------------------------------------------------------------------
-    # Six events
-    # ------------------------------------------------------------------
+    def _shift_down(self) -> None:
+        self.bid_price -= self.tick_size
+        self.ask_price -= self.tick_size
+        self._recompute_derived()
 
-    def buy_market_order(self) -> None:
-        """Consume one unit from the ask queue (buyer lifts the offer)."""
+    def _consume_ask(self) -> None:
         if self.ask_size <= 0:
             return
         self.ask_size -= 1
         if self.ask_size == 0:
-            self.ask_price += self.tick_size
-            self.bid_price += self.tick_size
+            self._shift_up()
             self.ask_size = self.default_depth
 
-    def sell_market_order(self) -> None:
-        """Consume one unit from the bid queue (seller hits the bid)."""
+    def _consume_bid(self) -> None:
         if self.bid_size <= 0:
             return
         self.bid_size -= 1
         if self.bid_size == 0:
-            self.ask_price -= self.tick_size
-            self.bid_price -= self.tick_size
+            self._shift_down()
             self.bid_size = self.default_depth
 
+    def buy_market_order(self) -> None:
+        self._consume_ask()
+
+    def sell_market_order(self) -> None:
+        self._consume_bid()
+
+    def cancel_ask(self) -> None:
+        self._consume_ask()
+
+    def cancel_bid(self) -> None:
+        self._consume_bid()
+
     def buy_limit_order(self) -> None:
-        """Add one unit to the bid queue."""
         self.bid_size += 1
 
     def sell_limit_order(self) -> None:
-        """Add one unit to the ask queue."""
         self.ask_size += 1
-
-    def cancel_bid(self) -> None:
-        """Remove one unit from the bid queue."""
-        if self.bid_size <= 0:
-            return
-        self.bid_size -= 1
-        if self.bid_size == 0:
-            self.ask_price -= self.tick_size
-            self.bid_price -= self.tick_size
-            self.bid_size = self.default_depth
-
-    def cancel_ask(self) -> None:
-        """Remove one unit from the ask queue."""
-        if self.ask_size <= 0:
-            return
-        self.ask_size -= 1
-        if self.ask_size == 0:
-            self.ask_price += self.tick_size
-            self.bid_price += self.tick_size
-            self.ask_size = self.default_depth
 
     def __repr__(self) -> str:
         return (
