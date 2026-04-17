@@ -1,6 +1,3 @@
-Here’s the README that doesn’t sell fluff. It shows the system, the trade-offs, and the direction.
-
----
 
 # Limit Order Book Simulator with Inventory-Aware Market Making
 
